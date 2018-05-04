@@ -182,6 +182,16 @@ function _M.new(name, shm, opts)
             end
         end
 
+        if opts.resurrect_ttl ~= nil then
+            if type(opts.resurrect_ttl) ~= "number" then
+                error("opts.resurrect_ttl must be a number", 2)
+            end
+
+            if opts.resurrect_ttl < 0 then
+                error("opts.resurrect_ttl must be >= 0", 2)
+            end
+        end
+
         if opts.resty_lock_opts ~= nil
             and type(opts.resty_lock_opts) ~= "table"
         then
@@ -259,6 +269,7 @@ function _M.new(name, shm, opts)
         shm_miss        = opts.shm_miss,
         ttl             = opts.ttl     or 30,
         neg_ttl         = opts.neg_ttl or 5,
+        resurrect_ttl   = opts.resurrect_ttl,
         lru_size        = opts.lru_size or 100,
         resty_lock_opts = opts.resty_lock_opts,
         l1_serializer   = opts.l1_serializer,
@@ -333,22 +344,10 @@ end
 
 local function set_lru(self, key, value, ttl, neg_ttl, l1_serializer)
     if value == nil then
-        if neg_ttl == 0 then
-            -- indefinite ttl for lua-resty-lrucache is 'nil'
-            neg_ttl = nil
-        end
+        ttl = neg_ttl
+        value = CACHE_MISS_SENTINEL_LRU
 
-        self.lru:set(key, CACHE_MISS_SENTINEL_LRU, neg_ttl)
-
-        return CACHE_MISS_SENTINEL_LRU
-    end
-
-    if ttl == 0 then
-        -- indefinite ttl for lua-resty-lrucache is 'nil'
-        ttl = nil
-    end
-
-    if l1_serializer then
+    elseif l1_serializer then
         local ok, err
         ok, value, err = pcall(l1_serializer, value)
         if not ok then
@@ -362,6 +361,11 @@ local function set_lru(self, key, value, ttl, neg_ttl, l1_serializer)
         if value == nil then
             return nil, "l1_serializer returned a nil value"
         end
+    end
+
+    if ttl == 0 then
+        -- indefinite ttl for lua-resty-lrucache is 'nil'
+        ttl = nil
     end
 
     self.lru:set(key, value, ttl)
@@ -472,15 +476,19 @@ end
 
 
 local function get_shm_set_lru(self, key, shm_key, l1_serializer)
-    local v, err = self.dict:get(shm_key)
-    if err then
+    local v, err, went_stale = self.dict:get_stale(shm_key)
+    if v == nil and err then
+        -- err can be 'flags' upon successful get_stale() calls, so we
+        -- also check v == nil
         return nil, "could not read from lua_shared_dict: " .. err
     end
 
     if self.shm_miss and v == nil then
         -- if we cache misses in another shm, maybe it is there
-        v, err = self.dict_miss:get(shm_key)
-        if err then
+        v, err, went_stale = self.dict_miss:get_stale(shm_key)
+        if v == nil and err then
+            -- err can be 'flags' upon successful get_stale() calls, so we
+            -- also check v == nil
             return nil, "could not read from lua_shared_dict: " .. err
         end
     end
@@ -490,6 +498,10 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
         if err then
             return nil, "could not deserialize value after lua_shared_dict " ..
                         "retrieval: " .. err
+        end
+
+        if went_stale then
+            return value, nil, went_stale
         end
 
         local remaining_ttl
@@ -511,6 +523,7 @@ end
 local function check_opts(self, opts)
     local ttl
     local neg_ttl
+    local resurrect_ttl
     local l1_serializer
     local shm_set_tries
 
@@ -541,6 +554,17 @@ local function check_opts(self, opts)
             end
         end
 
+        resurrect_ttl = opts.resurrect_ttl
+        if resurrect_ttl ~= nil then
+            if type(resurrect_ttl) ~= "number" then
+                error("opts.resurrect_ttl must be a number", 3)
+            end
+
+            if resurrect_ttl < 0 then
+                error("opts.resurrect_ttl must be >= 0", 3)
+            end
+        end
+
         l1_serializer = opts.l1_serializer
         if l1_serializer ~= nil and type(l1_serializer) ~= "function" then
            error("opts.l1_serializer must be a function", 3)
@@ -566,6 +590,10 @@ local function check_opts(self, opts)
         neg_ttl = self.neg_ttl
     end
 
+    if not resurrect_ttl then
+        resurrect_ttl = self.resurrect_ttl
+    end
+
     if not l1_serializer then
         l1_serializer = self.l1_serializer
     end
@@ -574,7 +602,7 @@ local function check_opts(self, opts)
         shm_set_tries = self.shm_set_tries
     end
 
-    return ttl, neg_ttl, l1_serializer, shm_set_tries
+    return ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries
 end
 
 
@@ -617,19 +645,21 @@ function _M:get(key, opts, cb, ...)
 
     -- opts validation
 
-    local ttl, neg_ttl, l1_serializer, shm_set_tries = check_opts(self, opts)
+    local ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries =
+        check_opts(self, opts)
 
-    local err
-    data, err = get_shm_set_lru(self, key, namespaced_key, l1_serializer)
+    local err, went_stale
+    data, err, went_stale = get_shm_set_lru(self, key, namespaced_key,
+                                            l1_serializer)
     if err then
         return nil, err
     end
 
-    if data == CACHE_MISS_SENTINEL_LRU then
-        return nil, nil, 2
-    end
+    if data ~= nil and not went_stale then
+        if data == CACHE_MISS_SENTINEL_LRU then
+            data = nil
+        end
 
-    if data ~= nil then
         return data, nil, 2
     end
 
@@ -646,19 +676,28 @@ function _M:get(key, opts, cb, ...)
         return nil, "could not acquire callback lock: " .. lerr
     end
 
-    -- check for another worker's success at running the callback
+    do
+        -- check for another worker's success at running the callback, but
+        -- do not return data if it is still the same stale value (this is
+        -- possible if the value was still not evicted between the first
+        -- get() and this one)
 
-    data, err = get_shm_set_lru(self, key, namespaced_key, l1_serializer)
-    if err then
-        return unlock_and_ret(lock, nil, err)
-    end
+        local data_2, err, went_stale_2 = get_shm_set_lru(self, key,
+                                                          namespaced_key,
+                                                          l1_serializer)
+        if err then
+            return unlock_and_ret(lock, nil, err)
+        end
 
-    if data == CACHE_MISS_SENTINEL_LRU then
-        return unlock_and_ret(lock, nil, nil, 2)
-    end
+        if data_2 ~= nil and not went_stale_2 then
+            -- we got a fresh item from shm: other worker succeeded in running
+            -- the callback
+            if data_2 == CACHE_MISS_SENTINEL_LRU then
+                data_2 = nil
+            end
 
-    if data ~= nil then
-        return unlock_and_ret(lock, data, nil, 2)
+            return unlock_and_ret(lock, data_2, nil, 2)
+        end
     end
 
     -- data is nil, we are either the 1st worker to hold the lock, or
@@ -666,7 +705,18 @@ function _M:get(key, opts, cb, ...)
     -- finished to run the callback
 
     if lerr == "timeout" then
-        return nil, "could not acquire callback lock: timeout"
+        local errmsg = "could not acquire callback lock: timeout"
+
+        -- no stale data nor desire to resurrect it
+        if not went_stale or not resurrect_ttl then
+            return nil, errmsg
+        end
+
+        -- do not resurrect the value here (another worker is running the
+        -- callback and will either get the new value, or resurrect it for
+        -- us if the callback fails)
+
+        return data, errmsg, 4
     end
 
     -- still not in shm, we are the 1st worker to hold the lock, and thus
@@ -677,12 +727,36 @@ function _M:get(key, opts, cb, ...)
         return unlock_and_ret(lock, nil, "callback threw an error: " .. perr)
     end
 
-    data = perr
-
     if err then
         -- callback returned nil + err
-        return unlock_and_ret(lock, data, err)
+
+        -- no stale data nor desire to resurrect it
+        if not went_stale or not resurrect_ttl then
+            return unlock_and_ret(lock, perr, err)
+        end
+
+        -- we got 'data' from the shm, even though it is stale
+        --   1. resurrect: insert it back into shm if 'resurrect_ttl'
+        --   2. return a 4th argument signifying the retrieved data is stale
+
+        local res_data, res_err = set_shm_set_lru(self, key, namespaced_key,
+                                                  data, resurrect_ttl,
+                                                  resurrect_ttl, nil,
+                                                  shm_set_tries, l1_serializer)
+        if res_err then
+            ngx_log(WARN, "failed to resurrect stale data (", res_err, ")")
+        end
+
+        if res_data == CACHE_MISS_SENTINEL_LRU then
+            res_data = nil
+        end
+
+        return unlock_and_ret(lock, res_data, err, 4)
     end
+
+    -- successful callback run returned 'data, nil, new_ttl?'
+
+    data = perr
 
     -- override ttl / neg_ttl
 
@@ -770,8 +844,8 @@ function _M:set(key, opts, value)
         -- restrict this key to the current namespace, so we isolate this
         -- mlcache instance from potential other instances using the same
         -- shm
-        local ttl, neg_ttl, l1_serializer, shm_set_tries = check_opts(self,
-                                                                      opts)
+        local ttl, neg_ttl, _, l1_serializer, shm_set_tries = check_opts(self,
+                                                                         opts)
         local namespaced_key = self.name .. key
 
         set_lru(self, key, value, ttl, neg_ttl, l1_serializer)
