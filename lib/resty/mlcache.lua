@@ -277,6 +277,7 @@ function _M.new(name, shm, opts)
         resty_lock_opts = opts.resty_lock_opts,
         l1_serializer   = opts.l1_serializer,
         shm_set_tries   = opts.shm_set_tries or SHM_SET_DEFAULT_TRIES,
+        use_stale       = opts.use_stale,
     }
 
     if opts.ipc_shm or opts.ipc then
@@ -529,6 +530,7 @@ local function check_opts(self, opts)
     local neg_ttl
     local l1_serializer
     local shm_set_tries
+    local use_stale
 
     if opts ~= nil then
         if type(opts) ~= "table" then
@@ -572,6 +574,8 @@ local function check_opts(self, opts)
                 error("opts.shm_set_tries must be >= 1", 3)
             end
         end
+
+        use_stale = opts.use_stale
     end
 
     if not ttl then
@@ -590,7 +594,11 @@ local function check_opts(self, opts)
         shm_set_tries = self.shm_set_tries
     end
 
-    return ttl, neg_ttl, l1_serializer, shm_set_tries
+    if not use_stale then
+        use_stale = self.use_stale
+    end
+
+    return ttl, neg_ttl, l1_serializer, shm_set_tries, use_stale
 end
 
 
@@ -615,7 +623,7 @@ function _M:get(key, opts, cb, ...)
 
     -- worker LRU cache retrieval
 
-    local data = self.lru:get(key)
+    local data, stale = self.lru:get(key)
     if data == CACHE_MISS_SENTINEL_LRU then
         return nil, nil, 1
     end
@@ -633,7 +641,7 @@ function _M:get(key, opts, cb, ...)
 
     -- opts validation
 
-    local ttl, neg_ttl, l1_serializer, shm_set_tries = check_opts(self, opts)
+    local ttl, neg_ttl, l1_serializer, shm_set_tries, use_stale = check_opts(self, opts)
 
     local err
     data, err = get_shm_set_lru(self, key, namespaced_key, l1_serializer)
@@ -652,7 +660,16 @@ function _M:get(key, opts, cb, ...)
     -- not in shm either
     -- single worker must execute the callback
 
-    local lock, err = resty_lock:new(self.shm_locks, self.resty_lock_opts)
+    local lock_opts = self.resty_lock_opts
+    
+    if stale and use_stale then
+        if lock_opts then
+            lock_opts['timeout'] = 0
+        else
+            lock_opts = {timeout=0}
+        end
+    end
+    local lock, err = resty_lock:new(self.shm_locks, lock_opts)
     if not lock then
         return nil, "could not create lock: " .. err
     end
@@ -664,17 +681,19 @@ function _M:get(key, opts, cb, ...)
 
     -- check for another worker's success at running the callback
 
-    data, err = get_shm_set_lru(self, key, namespaced_key, l1_serializer)
-    if err then
-        return unlock_and_ret(lock, nil, err)
-    end
+    if not use_stale then
+        data, err = get_shm_set_lru(self, key, namespaced_key, l1_serializer)
+        if err then
+            return unlock_and_ret(lock, nil, err)
+        end
 
-    if data == CACHE_MISS_SENTINEL_LRU then
-        return unlock_and_ret(lock, nil, nil, 2)
-    end
+        if data == CACHE_MISS_SENTINEL_LRU then
+            return unlock_and_ret(lock, nil, nil, 2)
+        end
 
-    if data ~= nil then
-        return unlock_and_ret(lock, data, nil, 2)
+        if data ~= nil then
+            return unlock_and_ret(lock, data, nil, 2)
+        end
     end
 
     -- data is nil, we are either the 1st worker to hold the lock, or
@@ -682,7 +701,11 @@ function _M:get(key, opts, cb, ...)
     -- finished to run the callback
 
     if lerr == "timeout" then
-        return nil, "could not acquire callback lock: timeout"
+        if stale and use_stale then
+            return stale, nil, 1
+        else
+            return nil, "could not acquire callback lock: timeout"
+        end
     end
 
     -- still not in shm, we are the 1st worker to hold the lock, and thus
